@@ -1,10 +1,11 @@
-package com.alan.rpc.v2.consumer;
+package com.alan.rpc.v3.consumer;
 
-import com.alan.rpc.v2.common.RpcRequest;
-import com.alan.rpc.v2.common.RpcResponse;
-import com.alan.rpc.v2.common.Serializer;
+import com.alan.rpc.v3.common.RpcRequest;
+import com.alan.rpc.v3.common.RpcResponse;
+import com.alan.rpc.v3.common.Serializer;
+import com.alan.rpc.v3.registry.RegistryClient;
+import com.alan.rpc.v3.registry.ServiceInstance;
 import io.netty.bootstrap.Bootstrap;
-import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
@@ -13,36 +14,34 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 
 /**
- * RPC 客户端 - 支持动态代理
- * 可以创建代理对象，让远程调用像本地方法调用一样自然
+ * RPC 客户端 - 支持服务发现
  */
 public class RpcClient {
 
-    private final String host;
-    private final int port;
+    private final String registryHost;
+    private final int registryPort;
+    private final RegistryClient registryClient;
 
-    public RpcClient(String host, int port) {
-        this.host = host;
-        this.port = port;
+    public RpcClient(String registryHost, int registryPort) {
+        this.registryHost = registryHost;
+        this.registryPort = registryPort;
+        this.registryClient = new RegistryClient(registryHost, registryPort);
     }
 
     /**
      * 创建服务接口的代理对象
-     *
-     * @param interfaceClass 服务接口类
-     * @param <T>            接口类型
-     * @return 代理对象
      */
     @SuppressWarnings("unchecked")
     public <T> T getProxy(Class<T> interfaceClass) {
         return (T) Proxy.newProxyInstance(
                 interfaceClass.getClassLoader(),
                 new Class<?>[]{interfaceClass},
-                new RpcInvocationHandler()
+                new RpcInvocationHandler(interfaceClass.getName())
         );
     }
 
@@ -50,8 +49,19 @@ public class RpcClient {
      * 发起 RPC 调用
      */
     private Object invoke(String interfaceName, String methodName,
-                          Class<?>[] parameterTypes, Object[] parameters) throws Exception {
-        // 构建请求对象
+                         Class<?>[] parameterTypes, Object[] parameters) throws Exception {
+        // 从注册中心发现服务
+        List<ServiceInstance> instances = registryClient.discover(interfaceName);
+        if (instances.isEmpty()) {
+            throw new RuntimeException("没有可用的服务实例: " + interfaceName);
+        }
+
+        // 简单的负载均衡：取第一个可用实例
+        // v5 版本将实现更复杂的负载均衡策略
+        ServiceInstance instance = instances.get(0);
+        System.out.println("[客户端] 选择服务实例: " + instance.getAddress());
+
+        // 构建请求
         RpcRequest request = new RpcRequest();
         request.setRequestId(UUID.randomUUID().toString());
         request.setInterfaceName(interfaceName);
@@ -63,7 +73,7 @@ public class RpcClient {
         byte[] requestBytes = Serializer.serialize(request);
 
         // 发送请求并获取响应
-        byte[] responseBytes = sendRequest(requestBytes);
+        byte[] responseBytes = sendRequest(instance.getHost(), instance.getPort(), requestBytes);
 
         // 反序列化响应
         RpcResponse response = (RpcResponse) Serializer.deserialize(responseBytes);
@@ -78,7 +88,7 @@ public class RpcClient {
     /**
      * 发送请求到服务端
      */
-    private byte[] sendRequest(byte[] requestBytes) throws Exception {
+    private byte[] sendRequest(String host, int port, byte[] requestBytes) throws Exception {
         EventLoopGroup group = new NioEventLoopGroup();
         RpcClientHandler handler = new RpcClientHandler();
         CountDownLatch latch = new CountDownLatch(1);
@@ -94,29 +104,43 @@ public class RpcClient {
                         }
                     });
 
-            // 连接服务端
             ChannelFuture future = bootstrap.connect(host, port).sync();
-
-            // 设置回调
             handler.setLatch(latch);
 
-            // 发送请求 - 将 byte[] 包装成 ByteBuf
             io.netty.buffer.ByteBuf buffer = io.netty.buffer.Unpooled.buffer(requestBytes.length);
             buffer.writeBytes(requestBytes);
             future.channel().writeAndFlush(buffer);
 
-            // 等待响应
             latch.await();
 
-            // 获取响应数据
             byte[] responseBytes = handler.getResponse();
-
-            // 关闭连接
             future.channel().close().sync();
 
             return responseBytes;
         } finally {
             group.shutdownGracefully();
+        }
+    }
+
+    /**
+     * JDK 动态代理调用处理器
+     */
+    private class RpcInvocationHandler implements InvocationHandler {
+
+        private final String interfaceName;
+
+        public RpcInvocationHandler(String interfaceName) {
+            this.interfaceName = interfaceName;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            return RpcClient.this.invoke(
+                    interfaceName,
+                    method.getName(),
+                    method.getParameterTypes(),
+                    args
+            );
         }
     }
 
@@ -138,8 +162,7 @@ public class RpcClient {
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            // Netty 传递的是 ByteBuf，需要转换为 byte[]
-            ByteBuf buf = (ByteBuf) msg;
+            io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) msg;
             try {
                 response = new byte[buf.readableBytes()];
                 buf.readBytes(response);
@@ -154,24 +177,6 @@ public class RpcClient {
             cause.printStackTrace();
             ctx.close();
             latch.countDown();
-        }
-    }
-
-    /**
-     * JDK 动态代理调用处理器
-     * 拦截方法调用，将其转换为 RPC 请求
-     */
-    private class RpcInvocationHandler implements InvocationHandler {
-
-        @Override
-        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-            // 调用 RPC 方法
-            return RpcClient.this.invoke(
-                    method.getDeclaringClass().getName(),
-                    method.getName(),
-                    method.getParameterTypes(),
-                    args
-            );
         }
     }
 }
